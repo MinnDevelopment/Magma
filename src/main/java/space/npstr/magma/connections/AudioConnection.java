@@ -288,25 +288,25 @@ public class AudioConnection extends BaseSubscriber<ConnectionEvent> {
     private void startSendSystemIfReady() {
         //check udp connection info
         if (this.encryptionMode == null) {
-            log.trace("Not ready cause no encryption mode");
+            log.trace("Not ready because no encryption mode");
             return;
         } else if (this.secretKey == null) {
-            log.trace("Not ready cause no secret key");
+            log.trace("Not ready because no secret key");
             return;
         } else if (this.ssrc == null) {
-            log.trace("Not ready cause no ssrc");
+            log.trace("Not ready because no ssrc");
             return;
         } else if (this.udpTargetAddress == null) {
-            log.trace("Not ready cause no udp target address");
+            log.trace("Not ready because no udp target address");
             return;
         }
 
         //check audio processing/sending components
         if (this.sendHandler == null) {
-            log.trace("Not ready cause no send handler");
+            log.trace("Not ready because no send handler");
             return;
         } else if (this.sendSystem == null) {
-            log.trace("Not ready cause no send system");
+            log.trace("Not ready because no send system");
             return;
         }
 
@@ -320,7 +320,6 @@ public class AudioConnection extends BaseSubscriber<ConnectionEvent> {
     // ################################################################################
 
     public Mono<InetSocketAddress> handleUdpDiscovery(final InetSocketAddress targetAddress, final int ssrc) {
-
         final Supplier<InetSocketAddress> externalUdpAddressSupplier = () -> {
             log.trace("Discovering udp on thread {}", Thread.currentThread().getName());
             if (Schedulers.isInNonBlockingThread()) {
@@ -335,10 +334,10 @@ public class AudioConnection extends BaseSubscriber<ConnectionEvent> {
                     try {
                         Thread.sleep(100); //dont flood in case of errors
                     } catch (final InterruptedException ignored) {
-                        Thread.currentThread().interrupt();
+                        break;
                     }
                 }
-            } while (externalAddress == null && attempt < 100);
+            } while (externalAddress == null && attempt < 5); // Try 5 times
 
             if (externalAddress == null) {
                 log.error("Failed to discover external udp address");
@@ -352,7 +351,7 @@ public class AudioConnection extends BaseSubscriber<ConnectionEvent> {
         };
 
         return Mono.fromSupplier(externalUdpAddressSupplier)
-                .publishOn(Schedulers.elastic());//elastic scheduler is the correct choice for legacy blocking calls
+                   .publishOn(Schedulers.elastic());//elastic scheduler is the correct choice for legacy blocking calls
     }
 
     /**
@@ -365,30 +364,29 @@ public class AudioConnection extends BaseSubscriber<ConnectionEvent> {
         //We will now send a packet to discord to punch a port hole in the NAT wall.
         //This is called UDP hole punching.
         try {
-
             //Create a byte array of length 70 containing our ssrc.
-            final ByteBuffer buffer = ByteBuffer.allocate(70);    //70 taken from https://github.com/Rapptz/discord.py/blob/async/discord/voice_client.py#L208
-            buffer.putInt(ssrc);                            //Put the ssrc that we were given into the packet to send back to discord.
+            final ByteBuffer buffer = ByteBuffer.allocate(70); //70 taken from https://github.com/Rapptz/discord.py/blob/async/discord/voice_client.py#L208
+            buffer.putInt(ssrc);                               //Put the ssrc that we were given into the packet to send back to discord.
 
             //Construct our packet to be sent loaded with the byte buffer we store the ssrc in.
             final DatagramPacket discoveryPacket = new DatagramPacket(buffer.array(), buffer.array().length, remoteAddress);
             this.udpSocket.send(discoveryPacket);
 
             //Discord responds to our packet, returning a packet containing our external ip and the port we connected through.
-            final DatagramPacket receivedPacket = new DatagramPacket(new byte[70], 70);   //Give a buffer the same size as the one we sent.
+            // Give a buffer the same size as the one we sent.
+            final DatagramPacket receivedPacket = new DatagramPacket(new byte[70], 70);
             this.udpSocket.setSoTimeout(1000);
             this.udpSocket.receive(receivedPacket);
 
-            //The byte array returned by discord containing our external ip and the port that we used
-            //to connect to discord with.
+            //The byte array returned by discord containing our external ip and the port that we used to connect to discord with.
             final byte[] received = receivedPacket.getData();
 
             //Example string:"   121.83.253.66                                                   ��"
             //You'll notice that there are 4 leading nulls and a large amount of nulls between the the ip and
             // the last 2 bytes. Not sure why these exist.  The last 2 bytes are the port. More info below.
-            String ourIP = new String(received);//Puts the entire byte array in. nulls are converted to spaces.
-            ourIP = ourIP.substring(4, ourIP.length() - 2); //Removes the port that is stuck on the end of this string. (last 2 bytes are the port)
-            ourIP = ourIP.trim();                           //Removes the extra whitespace(nulls) attached to both sides of the IP
+            final int portBytes = 2, ssrcBytes = 4;
+            String ourIP = new String(received, portBytes, received.length - (portBytes + ssrcBytes));//Puts the bytes excluding ssrc and port into a string
+            ourIP = ourIP.trim(); //Removes the extra nulls attached to the end of the IP
 
             //The port exists as the last 2 bytes in the packet data, and is encoded as an UNSIGNED short.
             //Furthermore, it is stored in Little Endian instead of normal Big Endian.
@@ -396,19 +394,11 @@ public class AudioConnection extends BaseSubscriber<ConnectionEvent> {
             //Then we will need to deal with the fact that the bytes represent an unsigned short.
             //Java cannot deal with unsigned types, so we will have to promote the short to a higher type.
             //Options:  char or int.  I will be doing int because it is just easier to work with.
-            final byte[] portBytes = new byte[2];                 //The port is exactly 2 bytes in size.
-            portBytes[0] = received[received.length - 1];   //Get the second byte and store as the first
-            portBytes[1] = received[received.length - 2];   //Get the first byte and store as the second.
             //We have now effectively converted from Little Endian -> Big Endian by reversing the order.
-
-            //For more information on how this is converting from an unsigned short to an int refer to:
-            //http://www.darksleep.com/player/JavaAndUnsignedTypes.html
-            final int firstByte = (0x000000FF & ((int) portBytes[0]));    //Promotes to int and handles the fact that it was unsigned.
-            final int secondByte = (0x000000FF & ((int) portBytes[1]));   //
-
+            final int firstByte = (int) received[received.length - 1] & 0xFF;
+            final int secondByte = (int) received[received.length - 2] & 0xFF;
             //Combines the 2 bytes back together.
             final int ourPort = (firstByte << 8) | secondByte;
-
             return new InetSocketAddress(ourIP, ourPort);
         } catch (final Exception e) {
             log.trace("Exception when discovering udp", e);
